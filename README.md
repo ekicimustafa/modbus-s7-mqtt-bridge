@@ -1,6 +1,63 @@
 # modbus-s7-mqtt-bridge
 
-A lightweight, production-ready Python bridge that reads tags from industrial PLCs (Modbus TCP/RTU and Siemens S7) and publishes them to an MQTT broker. Designed as a building block for industrial IoT gateways.
+A lightweight, production-ready Python bridge that reads tags from industrial PLCs (Modbus TCP/RTU and Siemens S7) and publishes them to an MQTT broker. Designed as a building block for industrial IoT gateways — the OT edge component in a full IT/OT integration stack.
+
+---
+
+## The OT/IT Problem
+
+Industrial automation and IT systems speak fundamentally different languages:
+
+| OT (Field Level) | IT (Cloud/Software Level) |
+|------------------|--------------------------|
+| Siemens S7, Modbus RTU | REST APIs, WebSockets |
+| Polling cycles (100ms–10s) | Event-driven architecture |
+| Register addresses, DB blocks | JSON, time-series databases |
+| Deterministic, real-time | Scalable, distributed |
+| 20–30 year lifecycles | Continuous deployment |
+
+This bridge closes that gap. It speaks the OT protocols natively and produces clean, structured MQTT messages that any IT system can consume.
+
+---
+
+## Where This Fits
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  OT LAYER (Field)                                                   │
+│                                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+│  │ Siemens S7   │  │ Modbus RTU   │  │ Modbus TCP   │             │
+│  │ 1200 / 1500  │  │ Energy meter │  │ VFD / Sensor │             │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘             │
+│         │  S7comm          │  RS-485          │  TCP/IP             │
+└─────────┼──────────────────┼──────────────────┼────────────────────┘
+          │                  │                  │
+┌─────────▼──────────────────▼──────────────────▼────────────────────┐
+│  EDGE LAYER (this repo)                                             │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────┐       │
+│  │              modbus-s7-mqtt-bridge (Python)             │       │
+│  │  • Async polling per device, configurable interval      │       │
+│  │  • Tag scaling, type conversion                         │       │
+│  │  • SQLite offline buffer (survives broker outage)       │       │
+│  │  • Reconnect logic for both PLC and MQTT sides          │       │
+│  └─────────────────────────┬───────────────────────────────┘       │
+│                             │  MQTT (QoS 1)                        │
+│                     Raspberry Pi / x86 edge device                 │
+└─────────────────────────────┼──────────────────────────────────────┘
+                              │
+┌─────────────────────────────▼──────────────────────────────────────┐
+│  IT LAYER (Cloud / On-Premise Platform)                            │
+│                                                                     │
+│  MQTT Broker (EMQX)  →  Ingestion Service  →  TimescaleDB          │
+│                                →  Kafka (stream processing)        │
+│                                →  REST API (FastAPI)               │
+│                                →  Dashboard / Alerting             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+This bridge is the OT edge layer. For a full IoT platform reference implementation, see the production architecture notes below.
 
 ---
 
@@ -75,8 +132,8 @@ devices:
 
 MQTT output:
 ```
-factory/line1/conveyor-plc/motor_speed    → 145.3
-factory/line1/conveyor-plc/motor_running  → true
+factory/line1/conveyor-plc/motor_speed       → 145.3
+factory/line1/conveyor-plc/motor_running     → true
 factory/line1/s7-1500-main/temperature_zone1 → 87.4
 ```
 
@@ -96,19 +153,70 @@ factory/line1/s7-1500-main/temperature_zone1 → 87.4
 
 ---
 
-## Architecture
+## Real-World Protocol Notes
 
+**Modbus register addressing:**
+- Coils: `0xxxx` (read/write digital)
+- Discrete inputs: `1xxxx` (read-only digital)
+- Input registers: `3xxxx` (read-only analog)
+- Holding registers: `4xxxx` (read/write analog)
+- Some devices use zero-based addressing; set `address_mode: raw` in config if register 40001 maps to address 0.
+
+**Siemens S7 — known quirks:**
+- S7-300/400: rack/slot from hardware config (usually rack=0, slot=2)
+- S7-1200/1500: rack=0, slot=1 — but must enable "PUT/GET" in TIA Portal → Device properties → Protection
+- DB blocks must not be optimized (uncheck "Optimized block access" in TIA Portal)
+- PCS7: uses S7-400 hardware; same snap7 protocol but larger DB numbers
+
+**IEC 104 (power grid RTUs):**
+Not in this repo, but commonly used alongside Modbus in energy applications. IEC 104 is TCP-based, carries time-stamped measurements (IOA addressing), and is standard in SCADA ↔ distribution company communication.
+
+---
+
+## Deployment (Raspberry Pi / Edge Device)
+
+```bash
+# As a systemd service
+sudo cp modbus-s7-mqtt-bridge.service /etc/systemd/system/
+sudo systemctl enable modbus-s7-mqtt-bridge
+sudo systemctl start modbus-s7-mqtt-bridge
 ```
-┌─────────────┐    S7comm/     ┌──────────────────┐
-│ Siemens S7  │─── Modbus ────▶│                  │
-│  1200/1500  │                │   bridge.py       │──── MQTT ────▶ Broker
-└─────────────┘                │  (async Python)  │
-                               │                  │──── SQLite ──▶ Offline
-┌─────────────┐    Modbus TCP  │   buffer         │               Buffer
-│  Any Modbus │───────────────▶│                  │
-│    Device   │                └──────────────────┘
-└─────────────┘
+
+**Production tips:**
+- Use a static IP or hostname reservation for PLCs — avoid DHCP for field devices
+- Set `TIOCEXCL` exclusive lock on RS-485 serial port to prevent multiple processes from accessing the port simultaneously
+- For RS-485 RTU: if using a USB-RS485 adapter, pin the device by serial number in udev rules (`/etc/udev/rules.d/`) — USB ports re-enumerate on reboot
+- Test RTU at 9600 baud first; most meters default to 9600 even if the datasheet says otherwise
+- On factory networks: many Modbus devices don't handle TCP keepalive well. If polling stalls silently, force reconnect after N consecutive timeouts.
+
+---
+
+## IT-Side Integration Example
+
+Once data reaches the MQTT broker, a minimal FastAPI consumer:
+
+```python
+import asyncio
+import json
+from aiomqtt import Client
+from datetime import datetime, timezone
+
+async def consume():
+    async with Client("192.168.1.100") as client:
+        await client.subscribe("factory/#")
+        async for message in client.messages:
+            topic_parts = str(message.topic).split("/")
+            device = topic_parts[-2]
+            tag = topic_parts[-1]
+            value = float(message.payload)
+            timestamp = datetime.now(timezone.utc)
+            # Insert into TimescaleDB, push to Kafka, trigger alerts...
+            print(f"{timestamp} | {device}.{tag} = {value}")
+
+asyncio.run(consume())
 ```
+
+For production platform architecture (multi-tenant, Kafka, TimescaleDB, on-premise deployment), see my other work: [SolarTools Platform](https://portal.solartools.com.tr) — source is private (production system).
 
 ---
 
@@ -126,20 +234,9 @@ Python 3.10+
 
 ---
 
-## Deployment (Raspberry Pi / Edge Device)
-
-```bash
-# As a systemd service
-sudo cp modbus-s7-mqtt-bridge.service /etc/systemd/system/
-sudo systemctl enable modbus-s7-mqtt-bridge
-sudo systemctl start modbus-s7-mqtt-bridge
-```
-
----
-
 ## Related Projects
 
-- [industrial-commissioning-checklist](https://github.com/ekicimustafa/industrial-commissioning-checklist) — Field commissioning checklist for industrial facilities
+- [industrial-commissioning-checklist](https://github.com/ekicimustafa/industrial-commissioning-checklist) — Field commissioning checklist for 10+ industrial facility types
 
 ---
 
